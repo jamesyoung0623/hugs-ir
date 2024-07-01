@@ -5,7 +5,7 @@ data/
 build
 diff_rasterization/diff_rast.egg-info
 diff_rasterization/dist
-submodules/nvdiffrast
+nvdiffrast
 tensorboard_3d
 screenshots
 *.pth
