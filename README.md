@@ -1,1 +1,1 @@
-# HUGS: Human Gaussian Splatting for Inverse Rendering
+# Human Gaussian Splatting for Inverse Rendering
