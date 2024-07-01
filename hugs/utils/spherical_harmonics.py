@@ -58,6 +58,72 @@ C4 = torch.tensor([
 ]).float().cuda() 
 
 
+def components_from_spherical_harmonics(degree: int, directions: torch.Tensor) -> torch.Tensor:
+    """
+    Returns value for each component of spherical harmonics.
+
+    Args:
+        degree: Number of spherical harmonic degrees to compute.
+        directions: Spherical hamonic coefficients
+    """
+    num_components = degree**2
+    components = torch.zeros((*directions.shape[:-1], num_components), device=directions.device)
+
+    assert 1 <= degree <= 4, f"SH degrees must be in [1, 4], got {degree}"
+    assert (directions.shape[-1] == 3), f"Direction input should have three dimensions. Got {directions.shape[-1]}"
+
+    x = directions[..., 0]
+    y = directions[..., 1]
+    z = directions[..., 2]
+
+    xx = x**2
+    yy = y**2
+    zz = z**2
+
+    xx, yy, zz = x * x, y * y, z * z
+    xy, yz, xz = x * y, y * z, x * z
+
+    # l0
+    components[..., 0] = 0.28209479177387814
+    # l1
+    if degree > 1:
+        components[..., 1] = -0.4886025119029199 * y
+        components[..., 2] = 0.4886025119029199 * z
+        components[..., 3] = -0.4886025119029199 * x
+
+    # l2
+    if degree > 2:
+        components[..., 4] = 1.0925484305920792 * xy
+        components[..., 5] = -1.0925484305920792 * yz
+        components[..., 6] = 0.31539156525252005 * (2.0 * zz - xx - yy)
+        components[..., 7] = -1.0925484305920792 * xz
+        components[..., 8] = 0.5462742152960396 * (xx - yy)
+
+    # l3
+    if degree > 3:
+        components[..., 9] = -0.5900435899266435 * y * (3 * xx - yy)
+        components[..., 10] = 2.890611442640554 * xy * z
+        components[..., 11] = -0.4570457994644658 * y * (4 * zz - xx - yy)
+        components[..., 12] = 0.3731763325901154 * z * (2 * zz - 3 * xx - 3 * yy)
+        components[..., 13] = -0.4570457994644658 * x * (4 * zz - xx - yy)
+        components[..., 14] = 1.445305721320277 * z * (xx - yy)
+        components[..., 15] = -0.5900435899266435 * x * (xx - 3 * yy)
+
+    # l4
+    if degree > 4:
+        components[..., 16] = 2.5033429417967046 * xy * (xx - yy)
+        components[..., 17] = -1.7701307697799304 * yz * (3 * xx - yy)
+        components[..., 18] = 0.9461746957575601 * xy * (7 * zz - 1)
+        components[..., 19] = -0.6690465435572892 * yz * (7 * zz - 3)
+        components[..., 20] = 0.10578554691520431 * (zz * (35 * zz - 30) + 3)
+        components[..., 21] = -0.6690465435572892 * xz * (7 * zz - 3)
+        components[..., 22] = 0.47308734787878004 * (xx - yy) * (7 * zz - 1)
+        components[..., 23] = -1.7701307697799304 * xz * (xx - 3 * yy)
+        components[..., 24] = 0.6258357354491761 * (xx * (xx - 3 * yy) - yy * (3 * xx - yy))
+
+    return components
+
+
 @torch.jit.script
 def eval_sh(
     deg: int, 

@@ -2,20 +2,26 @@
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
 #
+import os
+
+import numpy as np
 
 import torch
-import trimesh
-from torch import nn
-from loguru import logger
+import torch.nn as nn
 import torch.nn.functional as F
+
+import trimesh
+from loguru import logger
 from hugs.models.hugs_wo_trimlp import smpl_lbsmap_top_k, smpl_lbsweight_top_k
 
 from hugs.utils.general import (
+    build_rotation,
     inverse_sigmoid, 
     get_expon_lr_func, 
     strip_symmetric,
     build_scaling_rotation,
 )
+
 from hugs.utils.rotations import (
     axis_angle_to_rotation_6d, 
     matrix_to_quaternion, 
@@ -26,20 +32,34 @@ from hugs.utils.rotations import (
     rotation_6d_to_matrix,
     torch_rotation_matrix_from_vectors,
 )
+
 from hugs.cfg.constants import SMPL_PATH
 from hugs.utils.subdivide_smpl import subdivide_smpl_model
 
 from .modules.lbs import lbs_extra
 from .modules.smpl_layer import SMPL
 from .modules.triplane import TriPlane
-from .modules.decoders import AppearanceDecoder, DeformationDecoder, GeometryDecoder
+# from .modules.ngp import NGP
+from .modules.decoders import AppearanceDecoder, DeformationDecoder, GeometryDecoder, MotionWeightVolumeDecoder, BodyPoseRefiner
 
+# from hugs.utils.network import MotionBasisComputer
+
+# new
+from typing import Dict, List, Optional, Tuple
+
+from plyfile import PlyData, PlyElement
+from simple_knn._C import distCUDA2
+
+from arguments import GroupParams
+
+from hugs.utils.graphics import BasicPointCloud
+from hugs.utils.spherical_harmonics import RGB2SH
+from hugs.utils.system import mkdir_p
 
 SCALE_Z = 1e-5
 
 
 class HUGS_TRIMLP:
-
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
@@ -54,6 +74,8 @@ class HUGS_TRIMLP:
 
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
+
+        self.material_activation = torch.sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize
 
@@ -79,6 +101,18 @@ class HUGS_TRIMLP:
         self._xyz = torch.empty(0)
         self.scaling_multiplier = torch.empty(0)
 
+        # new
+        self._features_dc = torch.empty(0)
+        self._features_rest = torch.empty(0)
+        self._scaling = torch.empty(0)
+        self._rotation = torch.empty(0)
+        self._opacity = torch.empty(0)
+        self._normal = torch.empty(0)
+        self._albedo = torch.empty(0)
+        self._roughness = torch.empty(0)
+        self._metallic = torch.empty(0)
+        # new
+
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -98,12 +132,16 @@ class HUGS_TRIMLP:
         
         if betas is not None:
             self.create_betas(betas, requires_grad=False)
+
+        # self.motion_basis_computer = MotionBasisComputer()
+        # self.mweight_vol_dec = MotionWeightVolumeDecoder().cuda()
+        # self.pose_dec = BodyPoseRefiner().cuda()
         
-        self.triplane = TriPlane(n_features, resX=triplane_res, resY=triplane_res, resZ=triplane_res).to('cuda')
-        self.appearance_dec = AppearanceDecoder(n_features=n_features*3).to('cuda')
-        self.deformation_dec = DeformationDecoder(n_features=n_features*3, 
-                                                  disable_posedirs=disable_posedirs).to('cuda')
-        self.geometry_dec = GeometryDecoder(n_features=n_features*3, use_surface=use_surface).to('cuda')
+        # self.triplane = TriPlane(n_features, resX=triplane_res, resY=triplane_res, resZ=triplane_res).cuda()
+        # self.ngp = NGP(n_features).cuda()
+        # self.appearance_dec = AppearanceDecoder(n_features=n_features*3).cuda()
+        # self.deformation_dec = DeformationDecoder(n_features=n_features*3, disable_posedirs=disable_posedirs).cuda()
+        # self.geometry_dec = GeometryDecoder(n_features=n_features*3, use_surface=use_surface).cuda()
         
         if n_subdivision > 0:
             logger.info(f"Subdividing SMPL model {n_subdivision} times")
@@ -123,6 +161,9 @@ class HUGS_TRIMLP:
         self.get_vitruvian_verts()
         
         self.setup_functions()
+
+        self.chunk = 32768
+
     
     def create_body_pose(self, body_pose, requires_grad=False):
         body_pose = axis_angle_to_rotation_6d(body_pose.reshape(-1, 3)).reshape(-1, 23*6)
@@ -144,19 +185,79 @@ class HUGS_TRIMLP:
         
     def create_eps_offsets(self, eps_offsets, requires_grad=False):
         logger.info(f"NOT CREATED eps_offsets with shape: {eps_offsets.shape}, requires_grad: {requires_grad}")
+
+    def capture(self):
+        return (
+            self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self._normal,
+            self._albedo,
+            self._roughness,
+            self._metallic,
+            self.max_radii2D,
+            self.xyz_gradient_accum,
+            self.denom,
+            self.optimizer.state_dict(),
+            self.spatial_lr_scale,
+        )
     
     @property
-    def get_xyz(self):
+    def get_xyz(self) -> torch.Tensor:
         return self._xyz
+    
+    @property
+    def get_scaling(self) -> torch.Tensor:
+        return self.scaling_activation(self._scaling)
+
+    @property
+    def get_rotation(self) -> torch.Tensor:
+        return self.rotation_activation(self._rotation)
+
+    @property
+    def get_features(self) -> torch.Tensor:
+        features_dc = self._features_dc
+        features_rest = self._features_rest
+        return torch.cat((features_dc, features_rest), dim=1)
+
+    @property
+    def get_opacity(self) -> torch.Tensor:
+        return self.opacity_activation(self._opacity)
+
+    @property
+    def get_normal(self) -> torch.Tensor:
+        return F.normalize(self._normal, p=2, dim=-1)
+
+    @property
+    def get_albedo(self) -> torch.Tensor:
+        return self.material_activation(self._albedo)
+
+    @property
+    def get_roughness(self) -> torch.Tensor:
+        return self.material_activation(self._roughness)
+
+    @property
+    def get_metallic(self) -> torch.Tensor:
+        return self.material_activation(self._metallic)
+
+    def get_covariance(self, scaling_modifier: float = 1.0) -> torch.Tensor:
+        return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
     
     def state_dict(self):
         save_dict = {
             'active_sh_degree': self.active_sh_degree,
             'xyz': self._xyz,
-            'triplane': self.triplane.state_dict(),
-            'appearance_dec': self.appearance_dec.state_dict(),
-            'geometry_dec': self.geometry_dec.state_dict(),
-            'deformation_dec': self.deformation_dec.state_dict(),
+            # 'triplane': self.triplane.state_dict(),
+            # 'ngp': self.ngp.state_dict(),
+            # 'mweight_vol_dec': self.mweight_vol_dec.state_dict(),
+            # 'pose_dec': self.pose_dec.state_dict(),
+            # 'appearance_dec': self.appearance_dec.state_dict(),
+            # 'geometry_dec': self.geometry_dec.state_dict(),
+            # 'deformation_dec': self.deformation_dec.state_dict(),
             'scaling_multiplier': self.scaling_multiplier,
             'max_radii2D': self.max_radii2D,
             'xyz_gradient_accum': self.xyz_gradient_accum,
@@ -175,10 +276,13 @@ class HUGS_TRIMLP:
         opt_dict = state_dict['optimizer']
         self.spatial_lr_scale = state_dict['spatial_lr_scale']
         
-        self.triplane.load_state_dict(state_dict['triplane'])
-        self.appearance_dec.load_state_dict(state_dict['appearance_dec'])
-        self.geometry_dec.load_state_dict(state_dict['geometry_dec'])
-        self.deformation_dec.load_state_dict(state_dict['deformation_dec'])
+        # self.triplane.load_state_dict(state_dict['triplane'])
+        # self.ngp.load_state_dict(state_dict['ngp'])
+        # self.mweight_vol_dec.load_state_dict(state_dict['mweight_vol_dec'])
+        # self.pose_dec.load_state_dict(state_dict['pose_dec'])
+        # self.appearance_dec.load_state_dict(state_dict['appearance_dec'])
+        # self.geometry_dec.load_state_dict(state_dict['geometry_dec'])
+        # self.deformation_dec.load_state_dict(state_dict['deformation_dec'])
         self.scaling_multiplier = state_dict['scaling_multiplier']
         
         if cfg is None:
@@ -203,9 +307,10 @@ class HUGS_TRIMLP:
         return repr_str
 
     def canon_forward(self):
-        tri_feats = self.triplane(self.get_xyz)
-        appearance_out = self.appearance_dec(tri_feats)
-        geometry_out = self.geometry_dec(tri_feats)
+        # tri_feats = self.triplane(self.get_xyz)
+        # tri_feats = self.ngp(self.get_xyz)
+        # appearance_out = self.appearance_dec(tri_feats)
+        # geometry_out = self.geometry_dec(tri_feats)
         
         xyz_offsets = geometry_out['xyz']
         gs_rot6d = geometry_out['rotations']
@@ -405,7 +510,8 @@ class HUGS_TRIMLP:
         ext_tfs=None,
     ):
         
-        tri_feats = self.triplane(self.get_xyz)
+        # tri_feats = self.triplane(self.get_xyz)
+        tri_feats = self.ngp(self.get_xyz)
         appearance_out = self.appearance_dec(tri_feats)
         geometry_out = self.geometry_dec(tri_feats)
         
@@ -555,6 +661,228 @@ class HUGS_TRIMLP:
             'gt_lbs_weights': gt_lbs_weights,
         }
 
+    # def _query_mlp(self, pos_xyz):
+    #     pos_flat = torch.reshape(pos_xyz, [-1, pos_xyz.shape[-1]])   # dj: [307200, 3]
+        
+    #     result = self._apply_mlp_kernels(pos_flat=pos_flat)
+
+    #     output = {}
+
+    #     raws_flat = result['raws']
+    #     output['raws'] = torch.reshape(raws_flat, list(pos_xyz.shape[:-1]) + [raws_flat.shape[-1]])
+
+    #     return output
+
+    # def _expand_input(self, input_data, total_elem):
+    #     assert input_data.shape[0] == 1
+    #     input_size = input_data.shape[1]
+    #     return input_data.expand((total_elem, input_size))
+
+    # def _apply_mlp_kernels(self, pos_flat):
+    #     raws = []
+    #     # iterate ray samples by trunks
+    #     for i in range(0, pos_flat.shape[0], self.chunk):
+    #         start = i
+    #         end = i + self.chunk
+    #         end = min(end, pos_flat.shape[0])
+            
+    #         xyz = pos_flat[start:end]
+
+    #         # feat = self.triplane(xyz)
+    #         feat = self.ngp(xyz)
+
+    #         output = self.appearance_dec(feat)
+    #         rgb_output = output['rgb']
+    #         sigma_output = output['sigma']
+
+    #         cnl_mlp_output = torch.cat([rgb_output, sigma_output], dim=1)
+    #         raws += [cnl_mlp_output]
+
+    #     return {'raws': torch.cat(raws, dim=0).cuda()}
+
+    # def _sample_motion_fields(self, pts, motion_scale_Rs, motion_Ts, cnl_bbox_min_xyz, cnl_bbox_scale_xyz):
+    #     cnl_bbox_min_xyz = torch.from_numpy(cnl_bbox_min_xyz).cuda()
+    #     cnl_bbox_scale_xyz = torch.from_numpy(cnl_bbox_scale_xyz).cuda()
+
+    #     orig_shape = list(pts.shape)
+    #     pts = pts.reshape(-1, 3)
+
+    #     motion_weights_vol = self.mweight_vol_dec(motion_weights_priors=self.motion_weights_priors)
+    #     motion_weights_vol = motion_weights_vol[0]
+    #     motion_weights = motion_weights_vol[:-1]
+
+    #     weights_list = []
+    #     pos_list = []
+        
+    #     for i in range(motion_weights.size(0)):
+    #         pos = torch.matmul(motion_scale_Rs[i, :, :], pts.T).T + motion_Ts[i, :] # dj: pos in canonical space
+    #         pos_list.append(pos)
+    #         pos = (pos - cnl_bbox_min_xyz[None, :]) * cnl_bbox_scale_xyz[None, :] - 1.0 
+            
+    #         motion_weight = motion_weights[i].unsqueeze(0).unsqueeze(0)
+            
+    #         while len(pos.shape) != 5:
+    #             pos = pos.unsqueeze(0)
+            
+    #         weights = F.grid_sample(input=motion_weight, grid=pos, mode='bilinear', padding_mode='zeros', align_corners=True)
+    #         weights = weights[0, 0, 0, 0, :, None]
+
+    #         weights_list.append(weights) # per canonical pixel's bones weights
+
+    #     backwarp_motion_weights = torch.cat(weights_list, dim=-1)
+    #     total_bases = backwarp_motion_weights.shape[-1]
+    #     backwarp_motion_weights_sum = torch.sum(backwarp_motion_weights, dim=-1, keepdim=True)
+
+    #     weighted_motion_fields = []
+    #     for i in range(total_bases):
+    #         pos = pos_list[i]
+    #         weighted_pos = backwarp_motion_weights[:, i:i+1] * pos
+    #         weighted_motion_fields.append(weighted_pos)
+        
+    #     x_skel = torch.sum(torch.stack(weighted_motion_fields, dim=0), dim=0) / backwarp_motion_weights_sum.clamp(min=0.0001)
+    #     fg_likelihood_mask = backwarp_motion_weights_sum
+    #     x_skel = x_skel.reshape(orig_shape[:2]+[3])
+    #     backwarp_motion_weights = backwarp_motion_weights.reshape(orig_shape[:2]+[total_bases])
+    #     fg_likelihood_mask = fg_likelihood_mask.reshape(orig_shape[:2]+[1])
+
+    #     return x_skel, fg_likelihood_mask
+
+    # def _unpack_ray_batch(self, ray_batch):
+    #     rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6] 
+    #     bounds = torch.reshape(ray_batch[..., 6:8], [-1, 1, 2]) 
+    #     near, far = bounds[..., 0], bounds[..., 1] 
+    #     return rays_o, rays_d, near, far
+
+    # def _get_samples_along_ray(self, nerf_near, nerf_far):
+    #     t_vals = torch.linspace(0., 1., steps=128).cuda()
+    #     z_vals = nerf_near * (1.-t_vals) + nerf_far * (t_vals)
+    #     return z_vals
+
+    # def _stratified_sampling(self, z_vals):
+    #     mids = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
+    #     upper = torch.cat([mids, z_vals[..., -1:]], -1)
+    #     lower = torch.cat([z_vals[..., :1], mids], -1)
+    #     t_rand = torch.rand(z_vals.shape).cuda()
+    #     z_vals = lower + (upper - lower) * t_rand
+    #     return z_vals
+
+    # def _raw2outputs(self, raw, raw_mask, z_vals, rays_d, bgcolor):
+    #     def rgb_activation(rgb):
+    #         return torch.sigmoid(rgb)
+        
+    #     def sigma_activation(sigma):
+    #         return F.relu(sigma)
+
+    #     dists = z_vals[..., 1:] - z_vals[..., :-1]
+
+    #     infinity_dists = torch.Tensor([1e10])
+    #     infinity_dists = infinity_dists.expand(dists[..., :1].shape).cuda()
+    #     dists = torch.cat([dists, infinity_dists], dim=-1) 
+    #     dists = dists * torch.norm(rays_d[..., None, :], dim=-1)                 
+
+    #     rgb = rgb_activation(raw[..., :3])
+    #     sigma = sigma_activation(raw[..., 3])
+
+    #     alpha = 1.0 - torch.exp(-sigma*dists)
+    #     alpha = alpha * raw_mask[:, :, 0]    
+
+    #     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)).cuda(), 1.0 - alpha + 1e-10], dim=1), dim=1)[:, :-1]
+       
+    #     rgb_map = torch.sum(weights[..., None] * rgb, dim=1)                      
+    #     depth_map = torch.sum(weights * z_vals, dim=1)                           
+    #     weights_sum = torch.sum(weights, dim=1)                                      
+
+    #     bgcolor = torch.from_numpy(bgcolor).cuda()
+
+    #     rgb_map = rgb_map + (1.0 - weights_sum[..., None]) * bgcolor[None, :] / 255.
+
+    #     return rgb_map, depth_map, weights, weights_sum, alpha, sigma
+
+    # def _render_rays(self, rays_o, rays_d, nerf_near, nerf_far, motion_scale_Rs, motion_Ts, cnl_bbox_min_xyz, cnl_bbox_scale_xyz, bgcolor, **kwargs):
+    #     z_vals = self._get_samples_along_ray(nerf_near, nerf_far)
+    #     z_vals = self._stratified_sampling(z_vals)      
+
+    #     pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]
+
+    #     cnl_pts, pts_mask = self._sample_motion_fields(
+    #         pts=pts,
+    #         motion_scale_Rs=motion_scale_Rs[0], 
+    #         motion_Ts=motion_Ts[0], 
+    #         cnl_bbox_min_xyz=cnl_bbox_min_xyz, 
+    #         cnl_bbox_scale_xyz=cnl_bbox_scale_xyz
+    #     )
+
+    #     query_result = self._query_mlp(pos_xyz=cnl_pts)
+    #     raw = query_result['raws']
+        
+    #     rgb_map, depth_map, weights, weights_sum, alpha, sigma = self._raw2outputs(raw, pts_mask, z_vals, rays_d, bgcolor)
+        
+    #     return {'rgb': rgb_map, 'depth': depth_map, 'weights': weights, 'weights_sum': weights_sum, 'alpha': alpha, 'sigma': sigma}
+
+    # def _get_motion_base(self, dst_Rs, dst_Ts, cnl_gtfms):
+    #     motion_scale_Rs, motion_Ts = self.motion_basis_computer(dst_Rs, dst_Ts, cnl_gtfms)
+    #     return motion_scale_Rs, motion_Ts
+
+    # def _multiply_corrected_Rs(self, Rs, correct_Rs):
+    #     Rs = Rs.type(torch.HalfTensor).cuda()
+    #     correct_Rs = correct_Rs.type(torch.HalfTensor).cuda()
+    #     return torch.matmul(Rs.reshape(-1, 3, 3), correct_Rs.reshape(-1, 3, 3)).reshape(-1, 23, 3, 3)
+    
+    # def forward_nerf(self, rays, dst_Rs, dst_Ts, cnl_gtfms, motion_weights_priors, dst_posevec, nerf_near, nerf_far, **kwargs):
+    #     dst_Rs = torch.from_numpy(dst_Rs[None, ...]).cuda() # [1, 24, 3, 3]
+    #     dst_Ts = torch.from_numpy(dst_Ts[None, ...]).cuda() # [1, 24, 3]
+    #     dst_posevec = torch.from_numpy(dst_posevec[None, ...]).cuda() # [1, 69]
+
+    #     cnl_gtfms = torch.from_numpy(cnl_gtfms[None, ...]).cuda()
+    #     self.motion_weights_priors =torch.from_numpy(motion_weights_priors[None, ...]).cuda()
+
+    #     # pose_out = self.pose_dec(dst_posevec.float()) # [1, 23, 3, 3] axis-angle (3) to rotation matrix (3,3)
+            
+    #     # delta_Rs = pose_out['Rs'] # [1, 23, 3, 3]
+    #     # delta_Ts = pose_out.get('Ts', None)
+           
+    #     # dst_Rs_no_root = dst_Rs[:, 1:, ...]
+    #     # dst_Rs_no_root = self._multiply_corrected_Rs(dst_Rs_no_root, delta_Rs)
+    #     # dst_Rs = torch.cat([dst_Rs[:, 0:1, ...], dst_Rs_no_root], dim=1)
+        
+    #     # if delta_Ts is not None:
+    #     #     dst_Ts = dst_Ts + delta_Ts
+
+    #     # skeletal motion and non-rigid motion
+    #     ### -----------------------------------------
+    #     # dst_Rs [1, 24, 3, 3]; dst_Ts [1, 24, 3], cnl_gtfms [1, 24, 4, 4]
+    #     # motion_scale_Rs [1, 24, 3, 3]; motion_Ts [1, 24, 3] MAPPING from Target pose to T-pose
+    #     motion_scale_Rs, motion_Ts = self._get_motion_base(dst_Rs=dst_Rs, dst_Ts=dst_Ts, cnl_gtfms=cnl_gtfms)
+
+    #     kwargs['motion_scale_Rs'] = motion_scale_Rs
+    #     kwargs['motion_Ts'] = motion_Ts
+
+    #     ### -----------------------------------------
+    #     rays_o, rays_d = torch.from_numpy(rays).cuda()
+
+    #     rays_shape = rays_d.shape
+    #     rays_o = torch.reshape(rays_o, [-1, 3]).float()
+    #     rays_d = torch.reshape(rays_d, [-1, 3]).float()
+
+    #     nerf_near = torch.from_numpy(nerf_near).cuda()
+    #     nerf_far = torch.from_numpy(nerf_far).cuda()
+
+    #     all_ret = {}
+    #     for i in range(0, rays_o.shape[0], self.chunk):
+    #         ret = self._render_rays(rays_o[i:i+self.chunk], rays_d[i:i+self.chunk], nerf_near[i:i+self.chunk], nerf_far[i:i+self.chunk], **kwargs)
+    #         for k in ret:
+    #             if k not in all_ret:
+    #                 all_ret[k] = []
+    #             all_ret[k].append(ret[k])
+
+    #     all_ret = {k : torch.cat(all_ret[k], 0) for k in all_ret}
+
+    #     for k in all_ret:
+    #         k_shape = list(rays_shape[:-1]) + list(all_ret[k].shape[1:])
+    #         all_ret[k] = torch.reshape(all_ret[k], k_shape)
+
+    #     return all_ret
+
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             logger.info(f"Going from SH degree {self.active_sh_degree} to {self.active_sh_degree + 1}")
@@ -669,13 +997,29 @@ class HUGS_TRIMLP:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.spatial_lr_scale = cfg.smpl_spatial
-        
+
+        # params = [
+        #     {'params': [self._xyz], 'lr': cfg.position_init * cfg.smpl_spatial, "name": "xyz"},
+        #     {'params': self.triplane.parameters(), 'lr': cfg.vembed, 'name': 'v_embed'},
+        #     # {'params': self.ngp.parameters(), 'lr': cfg.vembed, 'name': 'ngp'},
+        #     # {'params': self.mweight_vol_dec.parameters(), 'lr': 0.0001, 'name': 'mweight_vol_dec'},
+        #     # {'params': self.pose_dec.parameters(), 'lr': 0.0001, 'name': 'pose_dec'},
+        #     {'params': self.geometry_dec.parameters(), 'lr': cfg.geometry, 'name': 'geometry_dec'},
+        #     {'params': self.appearance_dec.parameters(), 'lr': cfg.appearance, 'name': 'appearance_dec'},
+        #     {'params': self.deformation_dec.parameters(), 'lr': cfg.deformation, 'name': 'deform_dec'}
+        # ]
+
         params = [
-            {'params': [self._xyz], 'lr': cfg.position_init * cfg.smpl_spatial, "name": "xyz"},
-            {'params': self.triplane.parameters(), 'lr': cfg.vembed, 'name': 'v_embed'},
-            {'params': self.geometry_dec.parameters(), 'lr': cfg.geometry, 'name': 'geometry_dec'},
-            {'params': self.appearance_dec.parameters(), 'lr': cfg.appearance, 'name': 'appearance_dec'},
-            {'params': self.deformation_dec.parameters(), 'lr': cfg.deformation, 'name': 'deform_dec'},
+            {"params": [self._xyz], "lr": cfg.position_init * cfg.smpl_spatial, "name": "xyz"},
+            {"params": [self._features_dc], "lr": cfg.feature, "name": "f_dc"},
+            {"params": [self._features_rest], "lr": cfg.feature / 20.0, "name": "f_rest"},
+            {"params": [self._opacity], "lr": cfg.opacity, "name": "opacity"},
+            {"params": [self._normal], "lr": cfg.opacity, "name": "normal"},
+            {"params": [self._albedo], "lr": cfg.opacity, "name": "albedo"},
+            {"params": [self._roughness], "lr": cfg.opacity, "name": "roughness"},
+            {"params": [self._metallic], "lr": cfg.opacity, "name": "metallic"},
+            {"params": [self._scaling], "lr": cfg.scaling, "name": "scaling"},
+            {"params": [self._rotation], "lr": cfg.rotation, "name": "rotation"},
         ]
         
         if hasattr(self, 'global_orient') and self.global_orient.requires_grad:
@@ -692,7 +1036,8 @@ class HUGS_TRIMLP:
         
         self.non_densify_params_keys = [
             'global_orient', 'body_pose', 'betas', 'transl', 
-            'v_embed', 'geometry_dec', 'appearance_dec', 'deform_dec',
+            'ngp', 'v_embed', 'mweight_vol_dec', 'pose_dec', 
+            'geometry_dec', 'appearance_dec', 'deform_dec',
         ]
         
         for param in params:
@@ -713,7 +1058,186 @@ class HUGS_TRIMLP:
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
                 return lr
+            
+    def construct_list_of_attributes(self) -> List[str]:
+        l = ["x", "y", "z"]
+        # All channels except the 3 DC
+        for i in range(self._features_dc.shape[1] * self._features_dc.shape[2]):
+            l.append(f"f_dc_{i}")
+        for i in range(self._features_rest.shape[1] * self._features_rest.shape[2]):
+            l.append(f"f_rest_{i}")
+        l.append("opacity")
+        for i in range(self._normal.shape[1]):
+            l.append(f"normal_{i}")
+        for i in range(self._albedo.shape[1]):
+            l.append(f"albedo_{i}")
+        l.append("roughness")
+        l.append("metallic")
+        for i in range(self._scaling.shape[1]):
+            l.append(f"scale_{i}")
+        for i in range(self._rotation.shape[1]):
+            l.append(f"rot_{i}")
+        return l
+    
+    def save_ply(self, path: str) -> None:
+        mkdir_p(os.path.dirname(path))
 
+        xyz = self._xyz.detach().cpu().numpy()
+        f_dc = (
+            self._features_dc.detach()
+            .transpose(1, 2)
+            .flatten(start_dim=1)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+        f_rest = (
+            self._features_rest.detach()
+            .transpose(1, 2)
+            .flatten(start_dim=1)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+        opacities = self._opacity.detach().cpu().numpy()
+        normal = self._normal.detach().cpu().numpy()
+        albedo = self._albedo.detach().cpu().numpy()
+        roughness = self._roughness.detach().cpu().numpy()
+        metallic = self._metallic.detach().cpu().numpy()
+        scale = self._scaling.detach().cpu().numpy()
+        rotation = self._rotation.detach().cpu().numpy()
+
+        dtype_full = [(attribute, "f4") for attribute in self.construct_list_of_attributes()]
+
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        attributes = np.concatenate(
+            (
+                xyz,
+                f_dc,
+                f_rest,
+                opacities,
+                normal,
+                albedo,
+                roughness,
+                metallic,
+                scale,
+                rotation,
+            ),
+            axis=1,
+        )
+        elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, "vertex")
+        PlyData([el]).write(path)
+
+    def reset_opacity(self) -> None:
+        opacities_new = inverse_sigmoid(
+            torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01)
+        )
+        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        self._opacity = optimizable_tensors["opacity"]
+
+    def load_ply(self, path: str) -> None:
+        plydata = PlyData.read(path)
+
+        xyz = np.stack(
+            (
+                np.asarray(plydata.elements[0]["x"]),
+                np.asarray(plydata.elements[0]["y"]),
+                np.asarray(plydata.elements[0]["z"]),
+            ),
+            axis=1,
+        )
+        opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+        normal = np.stack(
+            (
+                np.asarray(plydata.elements[0]["normal_0"]),
+                np.asarray(plydata.elements[0]["normal_1"]),
+                np.asarray(plydata.elements[0]["normal_2"]),
+            ),
+            axis=1,
+        )
+        albedo = np.stack(
+            (
+                np.asarray(plydata.elements[0]["albedo_0"]),
+                np.asarray(plydata.elements[0]["albedo_1"]),
+                np.asarray(plydata.elements[0]["albedo_2"]),
+            ),
+            axis=1,
+        )
+        roughness = np.asarray(plydata.elements[0]["roughness"])[..., np.newaxis]
+        metallic = np.asarray(plydata.elements[0]["metallic"])[..., np.newaxis]
+
+        features_dc = np.zeros((xyz.shape[0], 3, 1))
+        features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
+        features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
+        features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
+
+        extra_f_names = [
+            p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")
+        ]
+        extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
+        assert len(extra_f_names) == 3 * (self.max_sh_degree + 1) ** 2 - 3
+        features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
+        for idx, attr_name in enumerate(extra_f_names):
+            features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
+        features_extra = features_extra.reshape(
+            (features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1)
+        )
+
+        scale_names = [
+            p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")
+        ]
+        scale_names = sorted(scale_names, key=lambda x: int(x.split("_")[-1]))
+        scales = np.zeros((xyz.shape[0], len(scale_names)))
+        for idx, attr_name in enumerate(scale_names):
+            scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
+        rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
+        rot_names = sorted(rot_names, key=lambda x: int(x.split("_")[-1]))
+        rots = np.zeros((xyz.shape[0], len(rot_names)))
+        for idx, attr_name in enumerate(rot_names):
+            rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
+        self._xyz = nn.Parameter(
+            torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True)
+        )
+        self._features_dc = nn.Parameter(
+            torch.tensor(features_dc, dtype=torch.float, device="cuda")
+            .transpose(1, 2)
+            .contiguous()
+            .requires_grad_(True)
+        )
+        self._features_rest = nn.Parameter(
+            torch.tensor(features_extra, dtype=torch.float, device="cuda")
+            .transpose(1, 2)
+            .contiguous()
+            .requires_grad_(True)
+        )
+        self._opacity = nn.Parameter(
+            torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True)
+        )
+        self._normal = nn.Parameter(
+            torch.tensor(normal, dtype=torch.float, device="cuda").requires_grad_(True)
+        )
+        self._albedo = nn.Parameter(
+            torch.tensor(albedo, dtype=torch.float, device="cuda").requires_grad_(True)
+        )
+        self._roughness = nn.Parameter(
+            torch.tensor(roughness, dtype=torch.float, device="cuda").requires_grad_(True)
+        )
+        self._metallic = nn.Parameter(
+            torch.tensor(metallic, dtype=torch.float, device="cuda").requires_grad_(True)
+        )
+        self._scaling = nn.Parameter(
+            torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True)
+        )
+        self._rotation = nn.Parameter(
+            torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True)
+        )
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        self.active_sh_degree = self.max_sh_degree
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -878,6 +1402,5 @@ class HUGS_TRIMLP:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[:update_filter.shape[0]][update_filter,:2], dim=-1, keepdim=True)
-        self.denom[update_filter] += 1
-        
+       self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[:update_filter.shape[0]][update_filter,:2], dim=-1, keepdim=True)
+       self.denom[update_filter] += 1

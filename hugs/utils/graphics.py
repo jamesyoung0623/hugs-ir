@@ -12,9 +12,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-import cv2
-import torch
 import math
+import torch
 import numpy as np
 from typing import NamedTuple
 

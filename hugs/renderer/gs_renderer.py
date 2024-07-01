@@ -8,10 +8,8 @@
 
 import math
 import torch
-from diff_gaussian_rasterization import (
-    GaussianRasterizationSettings, 
-    GaussianRasterizer
-)
+import torch.nn.functional as F
+from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 
 from hugs.utils.spherical_harmonics import SH2RGB
 from hugs.utils.rotations import quaternion_to_matrix
@@ -40,8 +38,12 @@ def render_human_scene(
         feats = human_gs_out['shs']
         means3D = human_gs_out['xyz']
         opacity = human_gs_out['opacity']
+        albedo = human_gs_out['albedo']
+        roughness = human_gs_out['roughness']
+        metallic = human_gs_out['metallic']
         scales = human_gs_out['scales']
         rotations = human_gs_out['rotq']
+        normals = human_gs_out['normals']
         active_sh_degree = human_gs_out['active_sh_degree']
     elif render_mode == 'scene':
         feats = scene_gs_out['shs']
@@ -57,8 +59,12 @@ def render_human_scene(
         means3D=means3D,
         feats=feats,
         opacity=opacity,
+        albedo = albedo,
+        roughness = roughness,
+        metallic = metallic,
         scales=scales,
         rotations=rotations,
+        normals=normals,
         data=data,
         scaling_modifier=scaling_modifier,
         bg_color=bg_color,
@@ -76,6 +82,7 @@ def render_human_scene(
             scaling_modifier=scaling_modifier,
             bg_color=human_bg_color if human_bg_color is not None else bg_color,
             active_sh_degree=human_gs_out['active_sh_degree'],
+            derive_normal=True,
         )
         render_pkg['human_img'] = render_human_pkg['render']
         render_pkg['human_visibility_filter'] = render_human_pkg['visibility_filter']
@@ -100,7 +107,7 @@ def render_human_scene(
     return render_pkg
     
     
-def render(means3D, feats, opacity, scales, rotations, data, scaling_modifier=1.0, bg_color=None, active_sh_degree=0):
+def render(means3D, feats, opacity, albedo, roughness, metallic, scales, rotations, normals, data, scaling_modifier=1.0, bg_color=None, active_sh_degree=0, override_color=None, inference=False, pad_normal=False, derive_normal=False):
     if bg_color is None:
         bg_color = torch.zeros(3, dtype=torch.float32, device="cuda")
         
@@ -121,7 +128,6 @@ def render(means3D, feats, opacity, scales, rotations, data, scaling_modifier=1.
         rgb = feats
     else:
         shs = feats
-
     
     raster_settings = GaussianRasterizationSettings(
         image_height=int(data['image_height']),
@@ -136,26 +142,112 @@ def render(means3D, feats, opacity, scales, rotations, data, scaling_modifier=1.
         campos=data['camera_center'],
         prefiltered=False,
         debug=False,
+        inference=inference,
+        argmax_depth=False,
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    assert albedo.shape[0] == roughness.shape[0] and albedo.shape[0] == metallic.shape[0]
+
+    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
+    # scaling / rotation by the rasterizer.
+    cov3D_precomp = None
+
+    # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
+    # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+    colors_precomp = None
+    if override_color is not None:
+        colors_precomp = override_color
         
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii = rasterizer(
+    (
+        rendered_image,
+        radii,
+        opacity_map,
+        depth_map,
+        normal_map_from_depth,
+        normal_map,
+        albedo_map,
+        roughness_map,
+        metallic_map,
+    ) = rasterizer(
         means3D=means3D,
         means2D=means2D,
-        shs=shs,
         opacities=opacity,
+        normal=normals,
+        shs=shs,
+        colors_precomp=colors_precomp,
+        albedo=albedo,
+        roughness=roughness,
+        metallic=metallic,
         scales=scales,
         rotations=rotations,
-        colors_precomp=rgb,
+        cov3D_precomp=cov3D_precomp,
+        derive_normal=derive_normal,
     )
-    rendered_image = torch.clamp(rendered_image, 0.0, 1.0)
+
+    normal_mask = (normal_map != 0).all(0, keepdim=True)
+    normal_from_depth_mask = (normal_map_from_depth != 0).all(0)
+    if pad_normal:
+        opacity_map = torch.where(  # NOTE: a trick to filter out 1 / 255
+            opacity_map < 0.004,
+            torch.zeros_like(opacity_map),
+            opacity_map,
+        )
+        opacity_map = torch.where(  # NOTE: a trick to filter out 1 / 255
+            opacity_map > 1.0 - 0.004,
+            torch.ones_like(opacity_map),
+            opacity_map,
+        )
+        normal_bg = torch.tensor([0.0, 0.0, 1.0], device=normal_map.device)
+        normal_map = normal_map * opacity_map + (1.0 - opacity_map) * normal_bg[:, None, None]
+        mask_from_depth = (normal_map_from_depth == 0.0).all(0, keepdim=True).float()
+        normal_map_from_depth = normal_map_from_depth * (1.0 - mask_from_depth) + mask_from_depth * normal_bg[:, None, None]
+
+    normal_map_from_depth = torch.where(
+        torch.norm(normal_map_from_depth, dim=0, keepdim=True) > 0,
+        F.normalize(normal_map_from_depth, dim=0, p=2),
+        normal_map_from_depth,
+    )
+    normal_map = torch.where(
+        torch.norm(normal_map, dim=0, keepdim=True) > 0,
+        F.normalize(normal_map, dim=0, p=2),
+        normal_map,
+    )
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {
         "render": rendered_image,
         "viewspace_points": screenspace_points,
-        "visibility_filter" : radii > 0,
+        "visibility_filter": radii > 0,
         "radii": radii,
+        "opacity_map": opacity_map,
+        "depth_map": depth_map,
+        "normal_map_from_depth": normal_map_from_depth,
+        "normal_from_depth_mask": normal_from_depth_mask,
+        "normal_map": normal_map,
+        "normal_mask": normal_mask,
+        "albedo_map": albedo_map,
+        "roughness_map": roughness_map,
+        "metallic_map": metallic_map,
     }
+    # rendered_image, radii = rasterizer(
+    #     means3D=means3D,
+    #     means2D=means2D,
+    #     shs=shs,
+    #     opacities=opacity,
+    #     scales=scales,
+    #     rotations=rotations,
+    #     colors_precomp=rgb,
+    # )
+    # rendered_image = torch.clamp(rendered_image, 0.0, 1.0)
+    # # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+    # # They will be excluded from value updates used in the splitting criteria.
+    # return {
+    #     "render": rendered_image,
+    #     "viewspace_points": screenspace_points,
+    #     "visibility_filter" : radii > 0,
+    #     "radii": radii,
+    # }

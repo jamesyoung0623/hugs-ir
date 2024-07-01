@@ -2,11 +2,13 @@
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
 #
-
-import torch
 import os
 import numpy as np
+
+import torch
 from torch import nn
+import torch.nn.functional as F
+
 from loguru import logger
 from plyfile import PlyData, PlyElement
 from pytorch3d.ops.knn import knn_points
@@ -19,6 +21,7 @@ from hugs.utils.general import (
     strip_symmetric,
     build_scaling_rotation,
 )
+
 from hugs.utils.rotations import (
     axis_angle_to_rotation_6d, 
     matrix_to_quaternion,  
@@ -27,11 +30,23 @@ from hugs.utils.rotations import (
     rotation_6d_to_axis_angle, 
     torch_rotation_matrix_from_vectors,
 )
+
 from hugs.cfg.constants import SMPL_PATH
 from hugs.utils.subdivide_smpl import subdivide_smpl_model
 
 from .modules.smpl_layer import SMPL
 
+# new
+from typing import Dict, List, Optional, Tuple
+
+from plyfile import PlyData, PlyElement
+from simple_knn._C import distCUDA2
+
+from arguments import GroupParams
+
+from hugs.utils.graphics import BasicPointCloud
+from hugs.utils.spherical_harmonics import RGB2SH
+from hugs.utils.system import mkdir_p
 
 SCALE_Z = 1e-5
 
@@ -120,7 +135,6 @@ def smpl_lbsweight_top_k(
 
 
 class HUGS_WO_TRIMLP:
-
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
@@ -136,20 +150,23 @@ class HUGS_WO_TRIMLP:
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
 
+        self.material_activation = torch.sigmoid
+
         self.rotation_activation = torch.nn.functional.normalize
 
     def __init__(
         self, 
         sh_degree: int, 
-        only_rgb: bool=False,
-        n_subdivision: int=0,  
+        only_rgb=False,
+        n_subdivision=2,  
         use_surface=False,  
         init_2d=False,
         rotate_sh=False,
         isotropic=False,
-        init_scale_multiplier=1.0,
+        init_scale_multiplier=0.5,
     ):
         self.only_rgb = only_rgb
+
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
@@ -158,12 +175,17 @@ class HUGS_WO_TRIMLP:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._normal = torch.empty(0)
+        self._albedo = torch.empty(0)
+        self._roughness = torch.empty(0)
+        self._metallic = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+
         self.device = 'cuda'
         self.use_surface = use_surface
         self.init_2d = init_2d
@@ -183,6 +205,7 @@ class HUGS_WO_TRIMLP:
             vertices=self.smpl_template.v_template.detach().cpu().numpy(), 
             faces=self.smpl_template.faces, process=False
         ).edges_unique
+
         self.edges = torch.from_numpy(edges).to(self.device).long()
         
         self.init_values = {}
@@ -227,24 +250,88 @@ class HUGS_WO_TRIMLP:
         }
         return save_dict
     
-    def restore(self, state_dict, cfg):
-        self.active_sh_degree = state_dict['active_sh_degree']
-        self._xyz = state_dict['xyz']
-        self._features_dc = state_dict['features_dc']
-        self._features_rest = state_dict['features_rest']
-        self._scaling = state_dict['scaling']
-        self._rotation = state_dict['rotation']
-        self._opacity = state_dict['opacity']
-        self.max_radii2D = state_dict['max_radii2D']
-        xyz_gradient_accum = state_dict['xyz_gradient_accum']
-        denom = state_dict['denom']
-        opt_dict = state_dict['optimizer']
-        self.spatial_lr_scale = state_dict['spatial_lr_scale']
+    def capture(
+        self,
+    ) -> Tuple[
+        int,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.optim.Optimizer,
+        float,
+    ]:
+        return (
+            self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self._normal,
+            self._albedo,
+            self._roughness,
+            self._metallic,
+            self.max_radii2D,
+            self.xyz_gradient_accum,
+            self.denom,
+            self.optimizer.state_dict(),
+            self.spatial_lr_scale,
+        )
+
+    def restore(self, model_args, training_args=None):
+        if isinstance(model_args, tuple):
+            (
+                self.active_sh_degree,
+                self._xyz,
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self._normal,
+                self._albedo,
+                self._roughness,
+                self._metallic,
+                self.max_radii2D,
+                xyz_gradient_accum,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale,
+            ) = model_args
+        else:
+            self.active_sh_degree = model_args['active_sh_degree']
+            self._xyz = model_args['xyz']
+            self._features_dc = model_args['features_dc']
+            self._features_rest = model_args['features_rest']
+            self._scaling = model_args['scaling']
+            self._rotation = model_args['rotation']
+            self._opacity = model_args['opacity']
+            self._normal = model_args['normal']
+            self._albedo = model_args['albedo']
+            self._roughness = model_args['roughness']
+            self._metallic = model_args['metallic']
+            self.max_radii2D = model_args['max_radii2D']
+            xyz_gradient_accum = model_args['xyz_gradient_accum']
+            denom = model_args['denom']
+            opt_dict = model_args['optimizer']
+            self.spatial_lr_scale = model_args['spatial_lr_scale']
         
-        self.setup_optimizer(cfg)
-        self.xyz_gradient_accum = xyz_gradient_accum
-        self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+        if training_args is not None:
+            self.setup_optimizer(training_args)
+            self.xyz_gradient_accum = xyz_gradient_accum
+            self.denom = denom
+            self.optimizer.load_state_dict(opt_dict)
     
     def __repr__(self):
         repr_str = "HumanGS: \n"
@@ -284,6 +371,22 @@ class HUGS_WO_TRIMLP:
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
     
+    @property
+    def get_normal(self) -> torch.Tensor:
+        return F.normalize(self._normal, p=2, dim=-1)
+
+    @property
+    def get_albedo(self) -> torch.Tensor:
+        return self.material_activation(self._albedo)
+
+    @property
+    def get_roughness(self) -> torch.Tensor:
+        return self.material_activation(self._roughness)
+
+    @property
+    def get_metallic(self) -> torch.Tensor:
+        return self.material_activation(self._metallic)
+    
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
@@ -303,6 +406,10 @@ class HUGS_WO_TRIMLP:
         gs_xyz = self._xyz
         gs_opacity = self.opacity_activation(self._opacity)
         gs_shs = self.get_features
+
+        gs_albedo = self.material_activation(self._albedo)
+        gs_roughness = self.material_activation(self._roughness)
+        gs_metallic = self.material_activation(self._metallic)
         
         if self.isotropic:
             gs_scales = torch.ones_like(gs_scales) * torch.mean(gs_scales, dim=-1, keepdim=True)
@@ -311,12 +418,10 @@ class HUGS_WO_TRIMLP:
         gs_rotmat = quaternion_to_matrix(gs_rotq)
         
         if hasattr(self, 'global_orient') and global_orient is None:
-            global_orient = rotation_6d_to_axis_angle(
-                self.global_orient[dataset_idx].reshape(-1, 6)).reshape(3)
+            global_orient = rotation_6d_to_axis_angle(self.global_orient[dataset_idx].reshape(-1, 6)).reshape(3)
         
         if hasattr(self, 'body_pose') and body_pose is None:
-            body_pose = rotation_6d_to_axis_angle(
-                self.body_pose[dataset_idx].reshape(-1, 6)).reshape(23*3)
+            body_pose = rotation_6d_to_axis_angle(self.body_pose[dataset_idx].reshape(-1, 6)).reshape(23*3)
             
         if hasattr(self, 'betas') and betas is None:
             betas = self.betas
@@ -370,8 +475,10 @@ class HUGS_WO_TRIMLP:
             deformed_gs_rotq = quaternion_multiply(rotq, deformed_gs_rotq)
             deformed_gs_rotmat = quaternion_to_matrix(deformed_gs_rotq)
         
-        self.normals = torch.zeros_like(gs_xyz)
-        self.normals[:, 2] = 1.0
+        # self.normals = torch.zeros_like(gs_xyz)
+        # self.normals[:, 2] = 1.0
+
+        self.normals = F.normalize(self._normal, p=2, dim=-1)
         
         canon_normals = (gs_rotmat @ self.normals.unsqueeze(-1)).squeeze(-1)
         deformed_normals = (deformed_gs_rotmat @ self.normals.unsqueeze(-1)).squeeze(-1)
@@ -390,8 +497,12 @@ class HUGS_WO_TRIMLP:
             'rotmat_canon': gs_rotmat,
             'shs': deformed_gs_shs,
             'opacity': gs_opacity,
+            'lbs_weights': None,
             'normals': deformed_normals,
             'normals_canon': canon_normals,
+            'albedo': gs_albedo,
+            'roughness': gs_roughness,
+            'metallic': gs_metallic,
             'active_sh_degree': self.active_sh_degree,
         }
 
@@ -399,6 +510,42 @@ class HUGS_WO_TRIMLP:
         if self.active_sh_degree < self.max_sh_degree:
             logger.info(f"Going from SH degree {self.active_sh_degree} to {self.active_sh_degree + 1}")
             self.active_sh_degree += 1
+
+    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float) -> None:
+        self.spatial_lr_scale = spatial_lr_scale
+        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        features = (torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda())
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        # normal = torch.ones((fused_point_cloud.shape[0], 3), dtype=torch.float, device="cuda")
+        normal = torch.zeros((fused_point_cloud.shape[0], 3), dtype=torch.float, device="cuda")
+        normal[..., 2] = 1.0
+        albedo = torch.ones((fused_point_cloud.shape[0], 3), dtype=torch.float, device="cuda")
+        roughness = torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
+        metallic = torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
+
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._normal = nn.Parameter(normal.requires_grad_(True))
+        self._albedo = nn.Parameter(albedo.requires_grad_(True))
+        self._roughness = nn.Parameter(roughness.requires_grad_(True))
+        self._metallic = nn.Parameter(metallic.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     @torch.no_grad()
     def get_vitruvian_verts(self):
@@ -443,10 +590,7 @@ class HUGS_WO_TRIMLP:
         scales = torch.zeros_like(t_pose_verts)
         for v in range(t_pose_verts.shape[0]):
             selected_edges = torch.any(self.edges == v, dim=-1)
-            selected_edges_len = torch.norm(
-                t_pose_verts[self.edges[selected_edges][0]] - t_pose_verts[self.edges[selected_edges][1]], 
-                dim=-1
-            )
+            selected_edges_len = torch.norm(t_pose_verts[self.edges[selected_edges][0]] - t_pose_verts[self.edges[selected_edges][1]], dim=-1)
             selected_edges_len *= self.init_scale_multiplier
             scales[v, 0] = torch.log(torch.max(selected_edges_len))
             scales[v, 1] = torch.log(torch.max(selected_edges_len))
@@ -472,6 +616,10 @@ class HUGS_WO_TRIMLP:
         
         gs_normals = torch.zeros_like(vert_normals)
         gs_normals[:, 2] = 1.0
+
+        albedo = torch.ones((vert_normals.shape[0], 3), dtype=torch.float, device="cuda")
+        roughness = torch.ones((vert_normals.shape[0], 1), dtype=torch.float, device="cuda")
+        metallic = torch.ones((vert_normals.shape[0], 1), dtype=torch.float, device="cuda")
         
         norm_rotmat = torch_rotation_matrix_from_vectors(gs_normals, vert_normals)
 
@@ -488,6 +636,10 @@ class HUGS_WO_TRIMLP:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rotq.requires_grad_(True))
         self._opacity = nn.Parameter(opacity.requires_grad_(True))
+        self._normal = nn.Parameter(gs_normals.requires_grad_(True))
+        self._albedo = nn.Parameter(albedo.requires_grad_(True))
+        self._roughness = nn.Parameter(roughness.requires_grad_(True))
+        self._metallic = nn.Parameter(metallic.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def setup_optimizer(self, cfg):
@@ -496,13 +648,26 @@ class HUGS_WO_TRIMLP:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.spatial_lr_scale = cfg.smpl_spatial
         
+        # params = [
+        #     {'params': [self._xyz], 'lr': cfg.position_init * cfg.smpl_spatial, "name": "xyz"},
+        #     {'params': [self._features_dc], 'lr': cfg.feature, "name": "f_dc"},
+        #     {'params': [self._features_rest], 'lr': cfg.feature / 20.0, "name": "f_rest"},
+        #     {'params': [self._opacity], 'lr': cfg.opacity, "name": "opacity"},
+        #     {'params': [self._scaling], 'lr': cfg.scaling, "name": "scaling"},
+        #     {'params': [self._rotation], 'lr': cfg.rotation, "name": "rotation"}
+        # ]
+
         params = [
-            {'params': [self._xyz], 'lr': cfg.position_init * cfg.smpl_spatial, "name": "xyz"},
-            {'params': [self._features_dc], 'lr': cfg.feature, "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': cfg.feature / 20.0, "name": "f_rest"},
-            {'params': [self._opacity], 'lr': cfg.opacity, "name": "opacity"},
-            {'params': [self._scaling], 'lr': cfg.scaling, "name": "scaling"},
-            {'params': [self._rotation], 'lr': cfg.rotation, "name": "rotation"}
+            {"params": [self._xyz], "lr": cfg.position_init * cfg.smpl_spatial, "name": "xyz"},
+            {"params": [self._features_dc], "lr": cfg.feature, "name": "f_dc"},
+            {"params": [self._features_rest], "lr": cfg.feature / 20.0, "name": "f_rest"},
+            {"params": [self._opacity], "lr": cfg.opacity, "name": "opacity"},
+            {"params": [self._normal], "lr": cfg.opacity, "name": "normal"},
+            {"params": [self._albedo], "lr": cfg.opacity, "name": "albedo"},
+            {"params": [self._roughness], "lr": cfg.opacity, "name": "roughness"},
+            {"params": [self._metallic], "lr": cfg.opacity, "name": "metallic"},
+            {"params": [self._scaling], "lr": cfg.scaling, "name": "scaling"},
+            {"params": [self._rotation], "lr": cfg.rotation, "name": "rotation"},
         ]
         
         if hasattr(self, 'global_orient') and self.global_orient.requires_grad:
@@ -514,7 +679,7 @@ class HUGS_WO_TRIMLP:
         if hasattr(self, 'betas') and self.betas.requires_grad:
             params.append({'params': self.betas, 'lr': cfg.smpl_betas, 'name': 'betas'})
             
-        if hasattr(self, 'transl') and self.betas.requires_grad:
+        if hasattr(self, 'transl') and self.transl.requires_grad:
             params.append({'params': self.transl, 'lr': cfg.smpl_trans, 'name': 'transl'})
         
         self.non_densify_params_keys = ['global_orient', 'body_pose', 'betas', 'transl']
@@ -546,6 +711,12 @@ class HUGS_WO_TRIMLP:
         for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
             l.append('f_rest_{}'.format(i))
         l.append('opacity')
+        for i in range(self._normal.shape[1]):
+            l.append(f"normal_{i}")
+        for i in range(self._albedo.shape[1]):
+            l.append(f"albedo_{i}")
+        l.append("roughness")
+        l.append("metallic")
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
@@ -556,17 +727,20 @@ class HUGS_WO_TRIMLP:
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
         xyz = self._xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
+        normal = self._normal.detach().cpu().numpy()
+        albedo = self._albedo.detach().cpu().numpy()
+        roughness = self._roughness.detach().cpu().numpy()
+        metallic = self._metallic.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, f_dc, f_rest, opacities, normal, albedo, roughness, metallic, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -579,10 +753,37 @@ class HUGS_WO_TRIMLP:
     def load_ply(self, path):
         plydata = PlyData.read(path)
 
-        xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
-                        np.asarray(plydata.elements[0]["y"]),
-                        np.asarray(plydata.elements[0]["z"])),  axis=1)
+        xyz = np.stack(
+            (
+                np.asarray(plydata.elements[0]["x"]),
+                np.asarray(plydata.elements[0]["y"]),
+                np.asarray(plydata.elements[0]["z"])
+            ), 
+            axis=1
+        )
+
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+
+        normal = np.stack(
+            (
+                np.asarray(plydata.elements[0]["normal_0"]),
+                np.asarray(plydata.elements[0]["normal_1"]),
+                np.asarray(plydata.elements[0]["normal_2"]),
+            ),
+            axis=1
+        )
+
+        albedo = np.stack(
+            (
+                np.asarray(plydata.elements[0]["albedo_0"]),
+                np.asarray(plydata.elements[0]["albedo_1"]),
+                np.asarray(plydata.elements[0]["albedo_2"]),
+            ),
+            axis=1
+        )
+
+        roughness = np.asarray(plydata.elements[0]["roughness"])[..., np.newaxis]
+        metallic = np.asarray(plydata.elements[0]["metallic"])[..., np.newaxis]
 
         features_dc = np.zeros((xyz.shape[0], 3, 1))
         features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
@@ -614,8 +815,13 @@ class HUGS_WO_TRIMLP:
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._normal = nn.Parameter(torch.tensor(normal, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._albedo = nn.Parameter(torch.tensor(albedo, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._roughness = nn.Parameter(torch.tensor(roughness, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._metallic = nn.Parameter(torch.tensor(metallic, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        # self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -662,6 +868,10 @@ class HUGS_WO_TRIMLP:
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
         self._opacity = optimizable_tensors["opacity"]
+        self._normal = optimizable_tensors["normal"]
+        self._albedo = optimizable_tensors["albedo"]
+        self._roughness = optimizable_tensors["roughness"]
+        self._metallic = optimizable_tensors["metallic"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
@@ -680,7 +890,6 @@ class HUGS_WO_TRIMLP:
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
-
                 stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
                 stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
 
@@ -695,19 +904,29 @@ class HUGS_WO_TRIMLP:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
-        d = {"xyz": new_xyz,
-        "f_dc": new_features_dc,
-        "f_rest": new_features_rest,
-        "opacity": new_opacities,
-        "scaling" : new_scaling,
-        "rotation" : new_rotation}
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_normal, new_albedo, new_roughness, new_metallic, new_scaling, new_rotation):
+        d = {
+            "xyz": new_xyz,
+            "f_dc": new_features_dc,
+            "f_rest": new_features_rest,
+            "opacity": new_opacities,
+            "normal": new_normal,
+            "albedo": new_albedo,
+            "roughness": new_roughness,
+            "metallic": new_metallic,
+            "scaling" : new_scaling,
+            "rotation" : new_rotation
+        }
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
         self._opacity = optimizable_tensors["opacity"]
+        self._normal = optimizable_tensors["normal"]
+        self._albedo = optimizable_tensors["albedo"]
+        self._roughness = optimizable_tensors["roughness"]
+        self._metallic = optimizable_tensors["metallic"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
@@ -721,45 +940,51 @@ class HUGS_WO_TRIMLP:
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        
         # filter elongated gaussians
         scales = self.get_scaling
         med = scales.median(dim=1, keepdim=True).values 
         stdmed_mask = (((scales - med) / med).squeeze(-1) >= 1.0).any(dim=-1)
         selected_pts_mask = torch.logical_and(selected_pts_mask, stdmed_mask)
         
-        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
-        means =torch.zeros((stds.size(0), 3),device="cuda")
+        stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+        means = torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
-        new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
-        new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
-        new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
-        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8*N))
+        new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
+        new_normal = self._normal[selected_pts_mask].repeat(N, 1)
+        new_albedo = self._albedo[selected_pts_mask].repeat(N, 1)
+        new_roughness = self._roughness[selected_pts_mask].repeat(N, 1)
+        new_metallic = self._metallic[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_normal, new_albedo, new_roughness, new_metallic, new_scaling, new_rotation)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
-        grad_cond = torch.norm(grads, dim=-1) >= grad_threshold
-        scale_cond = torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent
-        selected_pts_mask = torch.where(grad_cond, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask, scale_cond)
+        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
+        new_normal = self._normal[selected_pts_mask]
+        new_albedo = self._albedo[selected_pts_mask]
+        new_roughness = self._roughness[selected_pts_mask]
+        new_metallic = self._metallic[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_normal, new_albedo, new_roughness, new_metallic, new_scaling, new_rotation)
 
     def densify_and_prune(self, human_gs_out, max_grad, min_opacity, extent, max_screen_size, max_n_gs=None):
         grads = self.xyz_gradient_accum / self.denom
@@ -776,8 +1001,10 @@ class HUGS_WO_TRIMLP:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        
         self.prune_points(prune_mask)
         self.n_gs = self.get_xyz.shape[0]
+
         torch.cuda.empty_cache()
         
     def add_densification_stats(self, viewspace_point_tensor, update_filter):

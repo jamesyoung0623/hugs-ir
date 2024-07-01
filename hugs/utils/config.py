@@ -52,7 +52,7 @@ def get_cfg_items(cfg):
         n_cfg_file = cfg_file.copy()
         for i, v in enumerate(cfg_vals):
             n_cfg_file[hyperparam_search_keys[i]] = v
-            n_cfg_file['exp_name'] += f'-{hyperparam_search_keys[i]}={v}'
+            # n_cfg_file['exp_name'] += f'-{hyperparam_search_keys[i]}={v}'
             
         list_of_cfgs.append(unflatten(n_cfg_file, separator='.'))
     

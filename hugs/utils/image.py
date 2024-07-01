@@ -18,16 +18,35 @@ import pathlib
 from torchvision.utils import make_grid
 from PIL import Image, ImageDraw, ImageFont
 from typing import Optional, Union, List, BinaryIO
-
+import numpy as np
+import matplotlib.pyplot as plt
 
 def mse(img1, img2):
     return (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
-
 
 def psnr(img1, img2):
     mse = (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
     return 20 * torch.log10(1.0 / torch.sqrt(mse))
 
+def viridis_cmap(gray: np.ndarray) -> np.ndarray:
+    """
+    Visualize a single-channel image using matplotlib's viridis color map
+    yellow is high value, blue is low
+    :param gray: np.ndarray, (H, W) or (H, W, 1) unscaled
+    :return: (H, W, 3) float32 in [0, 1]
+    """
+    colored = plt.cm.viridis(plt.Normalize()(gray.squeeze()))[..., :-1]
+    return colored.astype(np.float32)
+
+def turbo_cmap(gray: np.ndarray) -> np.ndarray:
+    """
+    Visualize a single-channel image using matplotlib's turbo color map
+    yellow is high value, blue is low
+    :param gray: np.ndarray, (H, W) or (H, W, 1) unscaled
+    :return: (H, W, 3) float32 in [0, 1]
+    """
+    colored = plt.cm.turbo(plt.Normalize()(gray.squeeze()))[..., :-1]
+    return colored.astype(np.float32)
 
 @torch.no_grad()
 def normalize_depth(depth, min=None, max=None):
@@ -43,7 +62,6 @@ def normalize_depth(depth, min=None, max=None):
     depth = (depth - min) / (max - min)
     depth = 1.0 - depth
     return depth
-
 
 @torch.no_grad()
 def save_image(
@@ -73,7 +91,6 @@ def save_image(
     draw = ImageDraw.Draw(im)
     draw.text((10, 10), text_labels, fill=(0, 0, 0), font=txt_font)
     im.save(fp, format=format)
-    
     
 def save_rgba_image(
     tensor: Union[torch.Tensor, List[torch.Tensor]],

@@ -25,7 +25,8 @@ class TriPlane(nn.Module):
 
     def forward(self, x):
         x = (x - self.center) / self.scale + 0.5
-
+        
+        x = x.clamp(min=0, max=1)
         assert x.max() <= 1 + EPS and x.min() >= -EPS, f"x must be in [0, 1], got {x.min()} and {x.max()}"
         x = x * 2 - 1
         shape = x.shape

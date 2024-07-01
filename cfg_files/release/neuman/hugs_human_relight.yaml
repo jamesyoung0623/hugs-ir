@@ -1,29 +1,31 @@
 seed: 0
 mode: human
 output_path: output
-exp_name: 20240303_1758_release_test
+exp_name: test
 dataset_path: ''
 detect_anomaly: false
 debug: false
 wandb: false
-eval: false
+eval: true
 bg_color: white
+gamma: true
+hdri: data/Environment_Maps/high_res_envmaps_2k/city.hdr
 dataset:
   name: neuman
-  seq: ["citron", "seattle", "bike", "lab", "jogging", "parkinglot"]
+  seq: ["lab"]
 train:
   batch_size: 1
   num_workers: 0
-  num_steps: 14998
-  save_ckpt_interval: 15000
+  num_steps: 34998
+  save_ckpt_interval: 35000
   val_interval: 1000
-  anim_interval: 15000
+  anim_interval: 35000
   optim_scene: true
   save_progress_images: false
   progress_save_interval: 10
 human:
-  name: hugs_trimlp
-  ckpt: null
+  name: hugs_wo_trimlp
+  ckpt: /home/jamesyoung0623/ml-hugs/output/human/neuman/lab/hugs_wo_trimlp/test/ckpt/chkpnt34998.pth
   sh_degree: 0
   n_subdivision: 2
   only_rgb: false
@@ -40,7 +42,7 @@ human:
   triplane_res: 256
   optim_pose: true
   optim_betas: false
-  optim_trans: true
+  optim_trans: false
   optim_eps_offsets: false
   activation: relu
   canon_nframes: 60
@@ -69,6 +71,7 @@ human:
     geometry: 0.001
     vembed: 0.001
     deformation: 0.0001
+    mweight: 0.00005
     scale_lr_w_npoints: false
   loss:
     ssim_w: 0.2

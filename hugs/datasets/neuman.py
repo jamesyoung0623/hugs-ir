@@ -21,6 +21,11 @@ from .neuman_utils.geometry.basics import Translation, Rotation
 from hugs.cfg.constants import AMASS_SMPLH_TO_SMPL_JOINTS, NEUMAN_PATH
 from hugs.utils.graphics import get_projection_matrix, BasicPointCloud
 
+from hugs.utils.body import body_pose_to_body_RTs, get_canonical_global_tfms, approx_gaussian_bone_volumes
+from hugs.utils.camera import apply_global_tfm_to_camera, get_rays_from_KRT, rays_intersect_3d_bbox
+
+from hugs.models.modules.smpl_numpy import SMPL as SMPL_NUMPY
+from hugs.datasets.utils import get_predefined_pose
 
 def get_center_and_diag(cam_centers):
     cam_centers = np.vstack(cam_centers)
@@ -185,7 +190,7 @@ class NeumanDataset(torch.utils.data.Dataset):
         self, seq, split, 
         render_mode='human_scene',
         add_bg_points=False, 
-        num_bg_points=204_800,
+        num_bg_points=204800,
         bg_sphere_dist=5.0,
         clean_pcd=False,
     ):
@@ -283,6 +288,8 @@ class NeumanDataset(torch.utils.data.Dataset):
         for k in smpl_params.keys():
             self.smpl_params[k] = torch.from_numpy(smpl_params[k]).float()
         
+        # self.smpl_params['transl'] /= 10
+
         self.sam_mask_dir = f'{dataset_path}/4d_humans/sam_segmentations'
         self.msk_lists = sorted(glob.glob(f"{self.sam_mask_dir}/*.png"))
         
@@ -299,6 +306,7 @@ class NeumanDataset(torch.utils.data.Dataset):
         if self.cached_data is None:
             self.load_data_to_cuda()
 
+
     def __len__(self):
         if self.split == "train":
             return len(self.train_split)
@@ -306,7 +314,127 @@ class NeumanDataset(torch.utils.data.Dataset):
             return len(self.val_split)
         elif self.split == "anim":
             return self.num_frames
+        
+    def skeleton_to_bbox(self, skeleton, bbox_offset=0.3):
+        min_xyz = np.min(skeleton, axis=0) - bbox_offset
+        max_xyz = np.max(skeleton, axis=0) + bbox_offset
+
+        return {'min_xyz': min_xyz, 'max_xyz': max_xyz}
+        
+    @staticmethod
+    def select_rays(select_inds, rays_o, rays_d, ray_img, nerf_near, nerf_far):
+        rays_o = rays_o[select_inds]
+        rays_d = rays_d[select_inds]
+        ray_img = ray_img[select_inds]
+        nerf_near = nerf_near[select_inds]
+        nerf_far = nerf_far[select_inds]
+        return rays_o, rays_d, ray_img, nerf_near, nerf_far
     
+    def get_patch_ray_indices(self, N_patch, ray_mask, subject_mask, patch_size, H, W):
+        assert subject_mask.dtype == np.bool_
+
+        list_ray_indices = []
+        list_mask = []
+        list_xy_min = []
+        list_xy_max = []
+
+        total_rays = 0
+        patch_div_indices = [total_rays]
+        for _ in range(N_patch):
+            candidate_mask = subject_mask
+
+            ray_indices, mask, xy_min, xy_max = self._get_patch_ray_indices(ray_mask, candidate_mask, patch_size, H, W)
+
+            assert len(ray_indices.shape) == 1
+            total_rays += len(ray_indices)
+
+            list_ray_indices.append(ray_indices)
+            list_mask.append(mask)
+            list_xy_min.append(xy_min)
+            list_xy_max.append(xy_max)
+            
+            patch_div_indices.append(total_rays)
+
+        select_inds = np.concatenate(list_ray_indices, axis=0)
+        patch_info = {
+            'mask': np.stack(list_mask, axis=0),
+            'xy_min': np.stack(list_xy_min, axis=0),
+            'xy_max': np.stack(list_xy_max, axis=0)
+        }
+        patch_div_indices = np.array(patch_div_indices)
+
+        return select_inds, patch_info, patch_div_indices
+
+    def _get_patch_ray_indices(self, ray_mask, candidate_mask, patch_size, H, W):
+        assert len(ray_mask.shape) == 1
+        assert ray_mask.dtype == np.bool_
+        assert candidate_mask.dtype == np.bool_
+
+        valid_ys, valid_xs = np.where(candidate_mask)
+
+        # determine patch center
+        select_idx = np.random.choice(valid_ys.shape[0], size=[1], replace=False)[0]
+        center_x = valid_xs[select_idx]
+        center_y = valid_ys[select_idx]
+
+        # determine patch boundary
+        half_patch_size = patch_size // 2
+        x_min = np.clip(a=center_x-half_patch_size, a_min=0, a_max=W-patch_size)
+        x_max = x_min + patch_size
+        y_min = np.clip(a=center_y-half_patch_size, a_min=0, a_max=H-patch_size)
+        y_max = y_min + patch_size
+
+        # x_min = 0
+        # x_max = W
+        # y_min = 0
+        # y_max = H
+        
+        sel_ray_mask = np.zeros_like(candidate_mask)
+        sel_ray_mask[y_min:y_max, x_min:x_max] = True
+
+        #####################################################
+        ## Below we determine the selected ray indices
+        ## and patch valid mask
+
+        sel_ray_mask = sel_ray_mask.reshape(-1)
+        inter_mask = np.bitwise_and(sel_ray_mask, ray_mask)
+        select_masked_inds = np.where(inter_mask)
+
+        masked_indices = np.cumsum(ray_mask) - 1
+        select_inds = masked_indices[select_masked_inds]
+        
+        inter_mask = inter_mask.reshape(H, W)
+
+        return select_inds, inter_mask[y_min:y_max, x_min:x_max], np.array([x_min, y_min]), np.array([x_max, y_max])
+
+    def sample_patch_rays(self, img, mask, H, W, subject_mask, ray_mask, rays_o, rays_d, ray_img, nerf_near, nerf_far):
+        N_patch = 1
+        patch_size = 160
+        select_inds, patch_info, patch_div_indices = \
+            self.get_patch_ray_indices(
+                N_patch=N_patch, 
+                ray_mask=ray_mask, 
+                subject_mask=subject_mask, 
+                patch_size=patch_size, 
+                H=H, W=W
+            )
+
+        rays_o, rays_d, ray_img, nerf_near, nerf_far = self.select_rays(select_inds, rays_o, rays_d, ray_img, nerf_near, nerf_far)
+        
+        targets = []
+        target_masks = []
+        for i in range(N_patch):
+            x_min, y_min = patch_info['xy_min'][i] 
+            x_max, y_max = patch_info['xy_max'][i]
+            targets.append(img[y_min:y_max, x_min:x_max])
+            target_masks.append(mask[y_min:y_max, x_min:x_max])
+        target_patches = np.stack(targets, axis=0) # (N_patches, P, P, 3)
+        target_patch_masks = np.stack(target_masks, axis=0) # (N_patches, P, P, 3)
+
+        patch_masks = patch_info['mask']  # boolean array (N_patches, P, P)
+
+        return rays_o, rays_d, ray_img, nerf_near, nerf_far, target_patches, target_patch_masks, patch_masks, patch_div_indices
+
     def get_single_item(self, i):
         
         if self.split == "train":
@@ -321,10 +449,12 @@ class NeumanDataset(torch.utils.data.Dataset):
         datum = {}
         if self.split in ['train', 'val']:
             img = cap.captured_image.image # cv2.imread(self.img_lists[idx])
+            img = (img[..., :3] / 255).astype(np.float32)
             
             msk = cv2.imread(self.msk_lists[idx], cv2.IMREAD_GRAYSCALE) / 255
             if self.mode == 'scene':
-                msk = cv2.dilate(msk, np.ones((20,20), np.uint8), msk, iterations=1)
+                msk = cv2.dilate(msk, np.ones((20, 20), np.uint8), msk, iterations=1)
+            msk = msk.astype(np.float32)
             
             # get bbox from mask
             rows = np.any(msk, axis=0)
@@ -332,13 +462,9 @@ class NeumanDataset(torch.utils.data.Dataset):
             ymin, ymax = np.where(rows)[0][[0, -1]]
             xmin, xmax = np.where(cols)[0][[0, -1]]
             bbox = np.array([xmin, ymin, xmax, ymax])
-
-            img = (img[..., :3] / 255).astype(np.float32)
-            msk = msk.astype(np.float32)
             
-            img = img.transpose(2, 0, 1)
             datum.update({
-                "rgb": torch.from_numpy(img).float(),
+                "rgb": torch.from_numpy(img.transpose(2, 0, 1)).float(),
                 "mask": torch.from_numpy(msk).float(),
                 "bbox": torch.from_numpy(bbox).float(),
             })
@@ -349,9 +475,9 @@ class NeumanDataset(torch.utils.data.Dataset):
         
         fovx = 2 * np.arctan(width / (2 * K[0, 0]))
         fovy = 2 * np.arctan(height / (2 * K[1, 1]))
-        zfar = max(cap.far['human'], cap.near['bkg']) + 1.0
-        znear = min(cap.near['human'], cap.near['bkg'])
-        zfar = max(zfar, 100.0)
+        # zfar = max(cap.far['human'], cap.near['bkg']) + 1.0
+        # znear = min(cap.near['human'], cap.near['bkg'])
+        zfar = 100.0 # max(zfar, 100.0)
         znear = 0.01 # min(znear, 0.01)
         
         world_view_transform = torch.from_numpy(cap.cam_pose.world_to_camera).T # torch.eye(4)
@@ -361,7 +487,7 @@ class NeumanDataset(torch.utils.data.Dataset):
         full_proj_transform = (world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0))).squeeze(0)
         camera_center = world_view_transform.inverse()[3, :3]
         cam_intrinsics = torch.from_numpy(cap.intrinsic_matrix).float()
-        
+
         datum.update({
             "fovx": fovx,
             "fovy": fovy,
@@ -382,6 +508,127 @@ class NeumanDataset(torch.utils.data.Dataset):
             "far": zfar,
         })
         
+        if self.split in ['train', 'val']:
+            self.smpl = SMPL_NUMPY('neutral', './data/smpl')
+            poses = np.zeros((72))
+            poses[3:] = get_predefined_pose('da_pose')[0]
+            betas = self.smpl_params["betas"].mean(dim=0).numpy()
+
+            _, self.canonical_joints = self.smpl(poses, betas)
+            self.canonical_bbox = self.skeleton_to_bbox(self.canonical_joints)
+
+            self.motion_weights_priors = approx_gaussian_bone_volumes(
+                self.canonical_joints,   
+                self.canonical_bbox['min_xyz'],
+                self.canonical_bbox['max_xyz'],
+            ).astype('float32')
+            
+            bgcolor = np.zeros((3)).astype('float32')
+            # bgcolor = np.random.rand(3).astype('float32')
+            
+            H, W = height, width
+            poses = np.zeros((72))
+            poses[3:] = self.smpl_params["body_pose"][idx].numpy()
+            betas = self.smpl_params["betas"][idx].numpy()
+
+            _, joints = self.smpl(poses, betas)
+
+            dst_bbox = self.skeleton_to_bbox(joints)
+            dst_poses = np.zeros((72))
+            dst_poses[3:] = self.smpl_params["body_pose"][idx].numpy()
+            dst_tpose_joints = self.canonical_joints
+
+            Rh = self.smpl_params["global_orient"][idx].numpy()
+            Th = self.smpl_params["transl"][idx].numpy()
+            E = apply_global_tfm_to_camera(E=cap.extrinsic_matrix, Rh=Rh, Th=Th)
+            R = E[:3, :3]
+            T = E[:3, 3] / 13.0
+
+            rays_o, rays_d = get_rays_from_KRT(H, W, K, R, T)
+            
+            img_cv2 = img.copy()
+            img_cv2[msk == 0] = bgcolor
+            
+            ray_img = img.reshape(-1, 3) 
+            rays_o = rays_o.reshape(-1, 3) # (H, W, 3) --> (N_rays, 3)
+            rays_d = rays_d.reshape(-1, 3)
+
+            # (selected N_samples, ), (selected N_samples, ), (N_samples, )
+            nerf_near, nerf_far, ray_mask = rays_intersect_3d_bbox(dst_bbox, rays_o, rays_d)
+            rays_o = rays_o[ray_mask]
+            rays_d = rays_d[ray_mask]
+            ray_img = ray_img[ray_mask]
+
+            nerf_near = nerf_near[:, None].astype('float32')
+            nerf_far = nerf_far[:, None].astype('float32')
+
+            rays_o, rays_d, ray_img, nerf_near, nerf_far, target_patches, target_patch_masks, patch_masks, patch_div_indices = \
+                self.sample_patch_rays(
+                    img=img_cv2, mask=msk, 
+                    H=H, W=W,
+                    subject_mask=msk > 0.,
+                    ray_mask=ray_mask,
+                    rays_o=rays_o, 
+                    rays_d=rays_d, 
+                    ray_img=ray_img, 
+                    nerf_near=nerf_near, 
+                    nerf_far=nerf_far
+                )
+
+            batch_rays = np.stack([rays_o, rays_d], axis=0) 
+
+            datum.update(
+                {
+                    'ray_mask': ray_mask,
+                    'rays': batch_rays,
+                    'nerf_near': nerf_near,
+                    'nerf_far': nerf_far,
+                    'bgcolor': bgcolor
+                }
+            )
+
+            datum.update(
+                {
+                    'patch_div_indices': patch_div_indices,
+                    'patch_masks': patch_masks,
+                    'target_patches': target_patches,
+                    'target_patch_masks': target_patch_masks
+                }
+            )
+
+            datum['target_rgbs'] = ray_img
+
+            dst_Rs, dst_Ts = body_pose_to_body_RTs(dst_poses, dst_tpose_joints)
+            cnl_gtfms = get_canonical_global_tfms(self.canonical_joints)
+            datum.update(
+                {
+                    'dst_Rs': dst_Rs,
+                    'dst_Ts': dst_Ts,
+                    'cnl_gtfms': cnl_gtfms
+                }
+            )
+
+            datum['motion_weights_priors'] = self.motion_weights_priors.copy()
+
+            min_xyz = self.canonical_bbox['min_xyz'].astype('float32')
+            max_xyz = self.canonical_bbox['max_xyz'].astype('float32')
+            datum.update(
+                {
+                    'cnl_bbox_min_xyz': min_xyz,
+                    'cnl_bbox_max_xyz': max_xyz,
+                    'cnl_bbox_scale_xyz': 2.0 / (max_xyz - min_xyz)
+                }
+            )
+
+            assert np.all(datum['cnl_bbox_scale_xyz'] >= 0)
+
+            dst_posevec_69 = dst_poses[3:] + 1e-2
+            datum.update(
+                {
+                    'dst_posevec': dst_posevec_69
+                }
+            )
+
         if self.split == 'anim':
             datum.update({
                 "manual_rotmat": self.manual_rotmat,

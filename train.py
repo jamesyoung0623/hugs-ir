@@ -23,21 +23,17 @@ from hugs.utils.general import safe_state, find_cfg_diff
 
 def get_logger(cfg):
     output_path = cfg.output_path
-    time_str = time.strftime("%Y-%m-%d_%H-%M-%S")
     mode = 'eval' if cfg.eval else 'train'
-    
     
     if cfg.mode in ['human', 'human_scene']:
         logdir = os.path.join(
             output_path, cfg.mode, cfg.dataset.name,
             cfg.dataset.seq, cfg.human.name, cfg.exp_name, 
-            time_str,
         )
     else:
         logdir = os.path.join(
             output_path, cfg.mode, cfg.dataset.name,
             cfg.dataset.seq, cfg.exp_name, # exp_diff_str, 
-            time_str,
         )
     cfg.logdir = logdir
     cfg.logdir_ckpt = os.path.join(logdir, 'ckpt')
@@ -64,7 +60,7 @@ def main(cfg):
     
     # get trainer
     trainer = GaussianTrainer(cfg)
-    
+
     if not cfg.eval:
         trainer.train()
         trainer.save_ckpt()

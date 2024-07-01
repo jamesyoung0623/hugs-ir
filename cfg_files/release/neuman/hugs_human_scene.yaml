@@ -1,6 +1,7 @@
 seed: 0
 mode: human_scene
 output_path: output
+# logdir_ckpt: /home/jamesyoung0623/ml-hugs/output/human_scene/neuman/lab/hugs_trimlp/demo-dataset.seq=lab/test/ckpt
 exp_name: demo
 dataset_path: ''
 detect_anomaly: false
@@ -10,14 +11,19 @@ eval: false
 bg_color: white
 dataset:
   name: neuman
-  seq: ["lab", "citron", "seattle", "bike", "jogging", "parkinglot"]
+  seq: ["lab"]
+  # seq: ["citron"]
+  # seq: ["seattle"]
+  # seq: ["bike"]
+  # seq: ["jogging"]
+  # seq: ["parkinglot"]
 train:
   batch_size: 1
   num_workers: 0
-  num_steps: 14998
-  save_ckpt_interval: 15000
+  num_steps: 149998
+  save_ckpt_interval: 150000
   val_interval: 1000
-  anim_interval: 15000
+  anim_interval: 150000
   optim_scene: true
   save_progress_images: false
   progress_save_interval: 10
@@ -38,9 +44,9 @@ human:
   run_init: false
   estimate_delta: true
   triplane_res: 256
-  optim_pose: true
+  optim_pose: false
   optim_betas: false
-  optim_trans: true
+  optim_trans: false
   optim_eps_offsets: false
   activation: relu
   canon_nframes: 60
@@ -50,7 +56,7 @@ human:
     wd: 0.0
     position: 0.00016
     position_init: 0.00016
-    position_final: 1.6e-06
+    position_final: 0.0000016
     position_delay_mult: 0.01
     position_max_steps: 30000
     opacity: 0.05
@@ -69,6 +75,7 @@ human:
     geometry: 0.001
     vembed: 0.001
     deformation: 0.0001
+    mweight: 0.00005 
     scale_lr_w_npoints: false
   loss:
     ssim_w: 0.2

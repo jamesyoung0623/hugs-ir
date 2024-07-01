@@ -69,6 +69,7 @@ human:
     geometry: 0.001
     vembed: 0.001
     deformation: 0.0001
+    mweight: 0.00005
     scale_lr_w_npoints: false
   loss:
     ssim_w: 0.2
